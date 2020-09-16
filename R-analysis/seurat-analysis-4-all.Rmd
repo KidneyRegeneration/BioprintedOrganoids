@@ -1,0 +1,1386 @@
+---
+title: "Bioprint2020 Analysis : all sets combined "
+output: 
+  html_notebook:
+    code_folding: hide
+    df_print: paged
+---
+
+## All sets combined analysis {.tabset}
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+This notebook describes the analysis comparing all datasets : handmade 'hand', single deposition organoids, and line organoids.
+
+Data have been normalised using SCTransform and integrated.
+
+### Load data
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(clustree)
+library(future)
+library(edgeR)
+library(dplyr)
+
+source("functions/export_marker_xls.R")
+source("functions/sub_cluster.R")
+source("functions/get_props_table.R")
+source("functions/do_pairwise_edgeR.R")
+source("functions/plot_by_set.R")
+
+
+if (supportsMulticore()){
+  
+plan('multiprocess', workers=16)
+options(future.globals.maxSize = 8000 * 1024^2)
+print('Notebook processed on Meerkat HPC using parallel processing')
+
+} else {
+  print('multi-core disabled on Rstudio')
+}
+
+date()
+
+condition.string <- 'all'
+
+```
+
+
+```{r load-data}
+
+if (!file.exists("output/integrated-all-clust.RDS")){
+
+int <- readRDS("output/integrated-all.RDS")   
+int <- RunPCA(int)
+int <- RunUMAP(int, dims=1:30)
+int <- FindNeighbors(int, dims = 1:30, verbose = F)
+int <- FindClusters(int, resolution = seq(0.1, 2, 0.1), verbose = F)
+
+saveRDS(int, "output/integrated-all-clust.RDS")
+
+} else {
+  int <- readRDS("output/integrated-all-clust.RDS")
+}
+
+
+#add metadata fields for condition and replicate
+
+int@meta.data['orig.name'] <- int@meta.data$orig.ident
+int@meta.data$orig.ident <- factor(int@meta.data$orig.name, 
+            levels = c("hand","dots","line"), 
+            labels = c("Man","R0", "R40"))
+
+table(int@meta.data$orig.ident)
+
+int@meta.data['rep'] <- paste(int@meta.data$orig.ident, 
+                              substring(int@meta.data$hash.ID, 1,5), sep = "_")
+
+
+```
+
+```{r plot-cell-numbers-by-set}
+
+sets.plt <- as.data.frame(table(int@meta.data$hash.ID, int@meta.data$orig.ident))
+
+sets.plt$Var1 <- factor(substr(sets.plt$Var1, 5, 5))
+
+sets.plt$Var2 <- factor(sets.plt$Var2, labels = c("Man","R0","R40"))
+
+sets.plt.obj <- ggplot(sets.plt, aes(x = Var2, y = Freq, shape = Var1)) + geom_point(size = 4) +
+  xlab(label = "") + ylab(label = "") + theme_classic() + theme(legend.title = element_blank())
+
+ggsave(filename = "plots/all/HTO-numbers-by-set.png", plot = sets.plt.obj, dpi = 300, units = "mm", width = 60, height = 60)
+
+```
+
+
+
+Display basic QC info
+
+```{r}
+print("cells per dataset: ")
+table(int@meta.data$orig.ident)
+print("total genes: ")
+nrow(int@assays$RNA@counts)
+print("Median genes per cell: ")
+median(int@meta.data$nFeature_RNA)
+print("Median UMI counts per cell: ")
+median(int@meta.data$nCount_RNA)
+```
+
+```{r CC-scoring}
+genes <- Seurat::cc.genes.updated.2019
+
+int <- CellCycleScoring(int, s.features = genes$s.genes, g2m.features = genes$g2m.genes)
+```
+
+### Global Clustering
+
+Clustree for multiple resolutions
+
+```{r clustree, fig.height=8, fig.width=10}
+clustree(int)
+
+```
+
+Using clustering resolution 0.4
+
+
+
+```{r fig.height=4, fig.width=6}
+
+int <- SetIdent(int, value = int@meta.data$integrated_snn_res.0.4)
+DefaultAssay(int) <- "RNA"
+int <- NormalizeData(int, verbose = F)
+
+DimPlot(int, label = T)
+
+```
+
+
+
+
+```{r cluster-QC-plots}
+p1 <- VlnPlot(int, features = "nCount_RNA", pt.size = 0)
+p2 <- VlnPlot(int, features = "nFeature_RNA", pt.size = 0)
+p3 <- VlnPlot(int, features = "percent.mito", pt.size = 0)
+p4 <- VlnPlot(int, features = "scrublet_score", pt.size = 0)
+
+gridExtra::grid.arrange(p1, p2, p3, p4)
+
+```
+
+```{r}
+
+print("raw numbers / proportions")
+cbind(table(int@active.ident, int$orig.ident), prop.table(table(int@active.ident, int$orig.ident), margin=2))
+
+
+```
+
+```{r global-cluster-props}
+
+df <- prop.table(table(int@active.ident, int$rep), margin = 2)
+df <- df %>% as.data.frame() 
+
+df['condition'] <- sapply(as.character(df$Var2), FUN = function(x){return(strsplit(x, split = "_")[[1]][1])})
+
+df <- df %>% group_by(Var1) %>% mutate(norm.prop = Freq / mean(Freq))
+
+df %>% ggplot(aes(x=condition,y=norm.prop)) + geom_point() + facet_wrap(~Var1) + geom_boxplot(alpha = 0.1)
+
+```
+
+
+
+### Global Markers
+
+```{r global-markers}
+
+if(!file.exists(paste0('output/', condition.string, '-all-cluster-markers.RDS'))){
+  markers <- FindAllMarkers(int, logfc.threshold = 0.25, only.pos = TRUE)
+  saveRDS(markers, paste0('output/', condition.string, '-all-cluster-markers.RDS'))
+  export_marker_xls(markers, xls.path = paste0("output/", condition.string, "-all_cluster_markers.xlsx"))
+ 
+}
+
+markers <- readRDS(paste0('output/', condition.string, '-all-cluster-markers.RDS'))
+
+```
+
+```{r}
+markers %>% group_by(cluster) %>% top_n(20, avg_logFC)
+```
+
+### Assign global identities
+
+
+```{r fig.height=8, fig.width=8}
+
+DimPlot(int, label = T)
+DimPlot(int, group.by = "Phase")
+
+FeaturePlot(int, features = c("PDGFRA", "PAX2", "SOX17", "PECAM1"), order = T)
+
+FeaturePlot(int, features = c("PAX2", "PAX8", "LHX1", "JAG1"), order = T)
+
+FeaturePlot(int, features = c("CITED1", "SIX2", "ROBO2", "WT1"), order = T)
+
+FeaturePlot(int, features = c("MEIS1", "SIX1","SOX9","PAX2"))
+
+FeaturePlot(int, features = c("GATA3", "HNF4A","SLC12A1","MAFB"), order = T)
+
+ggsave(filename = "plots/all/global-markers.png",
+FeaturePlot(int, features = c("WT1","PAX2","PDGFRA","SOX17"), ncol = 1, coord.fixed = T),
+width = 4, height = 14)
+```
+
+
+
+```{r assign-global-cell-type-and-plot}
+
+nephron.cluster <- c(4,11,10,12)
+endothelial.cluster <- c(14)
+total.clusters <- unique(int@active.ident)
+
+#assign nephron lineage clusters
+int@meta.data['neph'] <- int@active.ident %in% nephron.cluster
+
+#assign endothelial clusters
+int@meta.data['endo'] <- int@active.ident %in% endothelial.cluster
+
+#assign stomral clusters
+int@meta.data['stroma'] <- int@active.ident %in% (setdiff(total.clusters, c(nephron.cluster, endothelial.cluster)))
+
+
+int@meta.data['global.type'] <- NA
+int@meta.data$global.type[int@meta.data$neph] <- 'Nephron'
+int@meta.data$global.type[int@meta.data$stroma] <- 'Stroma'
+int@meta.data$global.type[int@meta.data$endo] <- 'Endothelial'
+int@meta.data$global.type <- factor(int@meta.data$global.type, levels = c("Stroma","Nephron","Endothelial"))
+
+summary(int@meta.data$global.type)
+
+global.type.colours <- c("orange","light blue","dark grey")
+
+global.type.umap <- DimPlot(int, group.by = 'global.type', 
+                            label = F, 
+                            cols = global.type.colours) 
+
+ggsave(filename = "plots/all/global-type-umap.png", units = "mm", width = 150, height = 120)
+```
+```{r global-plots-supp-figure, fig.height=8, fig.width=12}
+p1 <- DimPlot(int, label = T)
+p2 <- DimPlot(int, group.by = "Phase")
+p3 <- DimPlot(int, group.by = "global.type", label = TRUE)
+p4 <- DimPlot(int, group.by = "orig.ident")
+
+
+plt <- gridExtra::grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+ggsave(filename = "plots/all/global-clusters-umap.png",
+       plot = plt, width = 12, height = 8)
+```
+
+
+
+
+```{r plotting-global-proportions}
+
+global.props <- as.data.frame(prop.table(table(int@meta.data$rep, int@meta.data$global.type), margin = 1))
+
+colnames(global.props) <- c("replicate","cluster","prop")
+
+global.props["condition"] <- sapply(as.character(global.props$replicate), 
+                      FUN = function(x){ return(strsplit(x, split = "_")[[1]][1]) } )
+
+global.props <- global.props %>% group_by(cluster) %>% dplyr::mutate('norm.prop' = prop / mean(prop))
+
+global.ratio.plot <- ggplot(global.props, aes(x =condition, y = prop*100)) + 
+  geom_point() +
+  stat_summary(fun.y = "mean", 
+               geom = "point", 
+               size = 5, 
+               shape = 18, 
+               colour = "red", 
+               alpha = 0.5) + 
+  facet_wrap(~cluster, ncol = 1, scales = "free") + 
+   theme_classic() +  
+  xlab(label = "") +
+  ylab(label = "%") +
+    theme(strip.text.x = element_text(size=12), 
+          legend.title = element_blank(), 
+          legend.text = element_text(size = 10))
+  
+ggsave(global.ratio.plot, filename = "plots/all/global_ratio_plot.png", dpi = 300, width = 50, height = 120, units = 'mm')
+
+
+```
+
+```{r}
+for (c in unique(global.props$cluster)){
+st <- global.props %>% dplyr::filter(cluster == c)
+aa <- aov(prop~condition, data = st)
+print(paste("cluster", c))
+print(summary(aa))
+print(TukeyHSD(aa))
+print(pairwise.t.test(st$prop, st$condition))
+}
+```
+
+
+
+
+### Nephron sub-clustering
+
+```{r}
+
+if(!file.exists(paste0("output/integrated-", condition.string, "-neph-subclust.RDS"))){
+  int.neph <- subset(int, subset = global.type == 'Nephron')
+  int.neph <- sub_cluster(int.neph)
+  saveRDS(int.neph, paste0("output/integrated-", condition.string, "-neph-subclust.RDS"))
+}else{
+  int.neph <- readRDS(paste0("output/integrated-", condition.string, "-neph-subclust.RDS"))
+}
+
+DefaultAssay(int.neph) <- "RNA"
+int.neph <- NormalizeData(int.neph)
+
+```
+
+```{r clustree-neph, fig.height=6, fig.width=8}
+clustree(int.neph, assay = "SCT")
+```
+
+```{r assign-resolution-UMAP}
+int.neph <- SetIdent(int.neph, value = int.neph@meta.data$SCT_snn_res.0.6)
+
+DimPlot(int.neph, label = T)
+```
+
+```{r QC-metrics, fig.height=8, fig.width=8}
+
+p1 <- VlnPlot(int.neph, features = "nCount_RNA", pt.size = 0)
+p2 <- VlnPlot(int.neph, features = "nFeature_RNA", pt.size = 0)
+p3 <- VlnPlot(int.neph, features = "percent.mito", pt.size = 0)
+p4 <- VlnPlot(int.neph, features = "scrublet_score", pt.size = 0)
+
+gridExtra::grid.arrange(p1, p2, p3, p4)
+```
+
+Stromal genes correlate with doublet score.
+
+```{r}
+FeaturePlot(int.neph, features = c("scrublet_score", "PDGFRA","VIM","MAFB"))
+
+p1 <- DimPlot(int.neph, label = T)
+p2 <- FeaturePlot(int.neph, features = "SIX1")
+p3 <- FeaturePlot(int.neph, features = "JAG1")
+p4 <- FeaturePlot(int.neph, features = "MAFB")
+gridExtra::grid.arrange(p1, p2,p3,p4, nrow =2)
+```
+
+
+```{r fig.height=4, fig.width=8}
+clust.plt <- DimPlot(int.neph, label = T)
+phase.plt <- DimPlot(int.neph, group.by = "Phase")
+dbl.plt <- FeaturePlot(int.neph, features = "scrublet_score")
+set.plt <- DimPlot(int.neph, group.by = "orig.ident")
+
+gridExtra::grid.arrange(clust.plt, phase.plt, dbl.plt, set.plt, ncol = 2)
+
+```
+```{r remove-doublets}
+#remove cluster 6 and 9 - see above
+
+#int.neph <- subset(int.neph, idents = c(0,1,2,3,5,6,7,8))
+
+int.neph <- subset(int.neph, idents = c(0,1,2,3,4,5,7,8))
+
+```
+
+
+```{r}
+p1 <- DimPlot(int.neph, group.by = "Phase")
+p2 <- FeaturePlot(int.neph, features = "SIX2")
+p2 <- FeaturePlot(int.neph, features = "MAFB")
+p3 <- FeaturePlot(int.neph, features = "NPHS2")
+p4 <- FeaturePlot(int.neph, features = "GATA3")
+  
+  
+  
+```
+
+
+
+
+
+```{r}
+FeaturePlot(int.neph, features = c("PAX2", "PAX8", "LHX1", "JAG1"), order = T)
+
+FeaturePlot(int.neph, features = c("CITED1", "SIX2", "ROBO2", "WT1"), order = T)
+
+FeaturePlot(int.neph, features = c("PDGFRA", "DCN","PBX1","FOXD1"), order = T)
+
+FeaturePlot(int.neph, features = c("GATA3", "HNF4A","SLC12A1","MAFB"), order = T)
+
+FeaturePlot(int.neph, features = c("NPHS2", "PODXL","CTGF","MAFB"), order = T)
+```
+Feature plot for figure
+
+```{r plot-nephron-mafb-gata3-hnf4a}
+
+plt <- FeaturePlot(int.neph, features = c("MAFB", "HNF4A", "GATA3"), ncol = 1, coord.fixed = T)
+
+ggsave(filename = "plots/all/neph-mafb-hnf4a-gata3.png", plot = plt, dpi = 300, units = "in", width = 4, height = 4)
+
+```
+
+
+
+```{r nephron-umap-plot, fig.height=3, fig.width=4}
+
+neph.cluster.plt <- DimPlot(int.neph, label = T) 
+
+ggsave(filename = "plots/all/neph_UMAP.png", plot = neph.cluster.plt, 
+       units = "in", width = 4, height = 3)
+
+DimPlot(int.neph, label = T)
+
+```
+
+
+
+0-GATA3
+1-PODXL
+2-HNF1B
+3-SIX1 
+4-MAFB
+8-CUBN
+
+
+```{r id-plots, fig.height=9, fig.width=12}
+ggsave(filename = "plots/all/neph-markers-for-supp.png",
+FeaturePlot(int.neph, features = c("GATA3","HNF1B","CUBN","HNF4A",
+                                   "FOXC2","MAFB","PODXL","SIX2","EYA1"), ncol = 3, coord.fixed = T),
+width = 12, height = 9 
+)
+
+
+
+
+```
+
+```{r fig.height=6, fig.width=8}
+clust.plt <- DimPlot(int.neph, label = T) 
+phase.plt <- DimPlot(int.neph, group.by = "Phase")
+set.plt <- DimPlot(int.neph, group.by = "orig.ident")
+
+ggsave(filename = "plots/all/neph-clust-phase-for-supp.png",
+       gridExtra::grid.arrange(clust.plt, phase.plt, set.plt, ncol = 2),
+       width = 8, height = 6)
+```
+
+
+```{r plotting-proportions, fig.height=1.5, fig.width=6}
+
+# get proportions, excluding cycling cells
+
+neph.props <- get_props_table(int.neph)
+
+neph.props$condition <- factor(neph.props$condition, 
+                               levels = c("Man","R0","R40"))
+
+clusters.to.plot <- c(0,1,2,3,4,8)
+
+neph.props.forplot <- neph.props %>% dplyr::filter(cluster %in% clusters.to.plot)
+
+neph.props.forplot['named.cluster'] <- factor(neph.props.forplot$cluster, 
+              levels = c(3,4,1,2,0,8),
+              labels = c("Progenitor (3)", "Pre-Pod. (4)", "Podoctye (1)", "Pre-Tubule (2)","Distal (0)","Proximal (8)"))
+
+neph.props.plt <- ggplot(neph.props.forplot,
+                         aes(x = condition, y = prop*100)) + 
+  geom_point(size =1) + 
+  stat_summary(fun.y = "mean", geom = "point", shape=18, size = 4, colour = "red", alpha = 0.5)+
+  facet_wrap(~named.cluster, scales = "free", nrow=1) +
+  theme_classic() +
+  xlab(label = "") +
+  ylab(label = "%") +
+    theme(axis.line.x.bottom = element_blank(), axis.ticks.x = element_blank(),
+          strip.text.x = element_text(size=8), strip.background = element_blank(), 
+          axis.text = element_text(size=8))
+
+ggsave(neph.props.plt, filename = "plots/all/neph_clust_prop.png", dpi = 300,
+        units = "in", height = 1.5, width = 6)
+
+
+```
+
+
+
+
+
+```{r stats-testing-props}
+
+for (c in unique(neph.props$cluster)){
+st <- neph.props %>% dplyr::filter(cluster == c)
+aa <- aov(prop~condition, data = st)
+print(paste("cluster", c))
+print(summary(aa))
+print(TukeyHSD(aa))
+print(pairwise.t.test(st$prop, st$condition))
+}
+
+```
+
+
+Testing DE expression within cluster :
+
+
+```{r nephron-DE-testing-all-clusters}
+for (c in unique(int.neph@active.ident)){
+  print(paste0("cluster = ", c))
+  de.glm <- do_pairwise_edgeR(subset(int.neph, idents = c))
+  out.path <- paste0("DE-testing/neph_cluster-", c, "_")
+  print(out.path)
+  write.csv(x = de.glm$r40_man$table, file = paste0(out.path, "R40_v_man.csv"))
+  write.csv(x = de.glm$r40_r0$table, file = paste0(out.path, "R40_v_r0.csv"))
+  write.csv(x = de.glm$r0_man$table, file = paste0(out.path, "R0_v_man.csv"))
+  write.csv(x = de.glm$any$table, file = paste0(out.path, "any.csv"))
+}
+
+
+```
+
+```{r}
+
+all_r40_r0 <- lapply(unique(int.neph@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(int.neph, idents = x))
+  out <- de$r40_r0$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+all_r40_r0 <- do.call(rbind, all_r40_r0)
+write.csv(all_r40_r0, "DE-testing/all_r40_r0-DE.csv")
+all_r40_r0 %>% group_by(cluster) %>% summarise("n.de" = n())
+all_r40_r0 %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n())%>% arrange(-count)
+all_r40_r0 %>% group_by(gene) %>% filter(n()< 4) %>% write.csv(file = "DE-testing/neph-filtered-under4-r40_r0.csv")
+
+
+all_r40_man <- lapply(unique(int.neph@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(int.neph, idents = x))
+  out <- de$r40_man$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+
+all_r40_man <- do.call(rbind, all_r40_man)
+write.csv(all_r40_man, "DE-testing/all_r40_man-DE.csv")
+all_r40_man %>% group_by(cluster) %>% summarise("n.de" = n())
+all_r40_man %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n()) %>% arrange(-count)
+all_r40_man %>% group_by(gene) %>% filter(n()< 4) %>% write.csv(file = "DE-testing/neph-filtered-under4-r40_man.csv")
+
+all_any <- lapply(unique(int.neph@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(int.neph, idents = x))
+  out <- de$any$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+
+all_any <- do.call(rbind, all_any)
+write.csv(all_any, "DE-testing/all_any-DE.csv")
+all_any %>% group_by(cluster) %>% summarise("n.de" = n())
+all_any %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n()) %>% arrange(-count)
+all_any %>% group_by(gene) %>% filter(n()< 4) %>% write.csv(file = "DE-testing/neph-filtered-under4-any.csv")
+
+all_r0_man <- lapply(unique(int.neph@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(int.neph, idents = x))
+  out <- de$r0_man$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+
+all_r0_man <- do.call(rbind, all_r0_man)
+write.csv(all_r0_man, "DE-testing/all_r0_man-DE.csv")
+all_r0_man %>% group_by(cluster) %>% summarise("n.de" = n())
+all_r0_man %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n()) %>% arrange(-count)
+all_r0_man %>% group_by(gene) %>% filter(n()< 4) %>% write.csv(file = "DE-testing/neph-filtered-under4-r0_man.csv")
+
+
+
+```
+```{r}
+
+r40_r0.table <- all_r40_r0 %>% group_by(gene) %>% filter(n()< 4) %>% group_by(cluster) %>% summarise(n.de = n())
+
+
+r40_man.table <- all_r40_man %>% group_by(gene) %>% filter(n()< 4) %>% group_by(cluster) %>% summarise(n.de = n())
+write.csv(file = "DE-testing/neph-filtered-under4-r40_man.csv", x = r40_man.table)
+
+r0_man.table <- all_r0_man %>% group_by(gene) %>% filter(n()< 4) %>% group_by(cluster) %>% summarise(n.de = n())
+write.csv(file = "DE-testing/neph-filtered-under-4-r0_man.csv", x = r0_man.table)
+
+de.table <- dplyr::full_join(r40_r0.table, r40_man.table, by = "cluster") %>% as.data.frame()
+colnames(de.table) <- c("cluster","R40-R0", "R40-Man")
+
+de.table <- dplyr::full_join(de.table, r0_man.table, by = "cluster") %>% as.data.frame()
+colnames(de.table)[4] <- "R0-Man"
+
+de.table[is.na(de.table)] <- 0
+
+rownames(de.table) <- labels(de.table$cluster)
+
+de.table <- de.table %>% filter(cluster %in% c(0,1,2,3,4,8))
+
+
+de.table['cell.type'] <- c("Distal","Podocyte","Mesenchyme","Pre-Podocyte","Pre-Tubule","Proximal")
+
+pdf("plots/all/DE-genes-per-clust.pdf", width = 6, height = 4)
+gplots::heatmap.2(as.matrix(de.table[,2:4]), Colv = TRUE, labRow = de.table$cell.type, 
+                  Rowv = TRUE, dendrogram = "none", col = viridis::viridis(60), 
+                  density.info = "none", trace = 'none', cexRow = 0.5, cexCol = 0.5,  
+                  keysize = 1,
+                  key.par = list(cex=0.5), key.title = "", key.xlab = "No. DE genes")
+dev.off()
+
+
+
+```
+
+
+
+
+SOX4 in prox?
+The Transcription Factor Sry-Related HMG
+Box-4 (SOX4) is Required for Normal Renal
+Development In Vivo
+Jez Huang,1† Micel Arsenault,1† Martin Kann,2,3 Carlos Lopez-Mendez,4 Monique Saleh,1
+Dorota Wadowska,5 Mary Taglienti,2 Jacqueline Ho,6 Yuan Miao,1 David Sims,1 Jonathan Spears,1
+Alfonso Lopez,3 Glenda Wright,1 and Sunny Hartwig1
+*
+
+```{r testing-JV-Ml-lists-of-genes}
+
+jv.list <- c("SLC30A1","SLC51B","FABP3","SULT1E1")
+
+plot_by_set(int.neph, 8, jv.list)
+
+#ml used these ids
+#0 - early pod, 1 - distal, 2 - mesenchyme, 3 - mature pod, 5 - early tubule, 6 - cc, 7 - proximal, 8 - cc
+
+
+ml.earlypod <- c("RASGEF1B", "CCND1", "SLC48A1", "PCP4", "CTTNBP2","NPNT","HSPA8","PTPRA")
+plot_by_set(int.neph, 4, ml.earlypod)
+
+ml.dist <- c("CALB1", "SOX4", "CLDN4","FOSB","IGFBP2","ITGB1")
+plot_by_set(int.neph, 0, ml.dist)
+
+
+ml.mesencyme <- c("WT1", "MIF", "RDH10", "PCDH9", "HOXA7",
+                  "FOS", "SPRY1", "IER2", "SOX4", "MRC2", "GJA1","TAGLN","FAM133B","FAT3","DLK1")
+plot_by_set(int.neph, 3, ml.mesencyme)
+
+
+ml.maturepod <- c("SRSF5", "HES1")
+plot_by_set(int.neph, 1, ml.maturepod)
+
+
+ml.earlytub <- c("FXYD2")
+plot_by_set(int.neph, 2, ml.earlytub)
+
+
+ml.prox <- c("SPP1", "FXYD2", "JAG1","SOX4")
+plot_by_set(int.neph, 8, ml.prox)
+
+
+
+
+
+```
+
+
+MRC2 :
+Mannose Receptor 2 Attenuates Renal Fibrosis
+Jesús M. López-Guisa, Xiaohe Cai, Sarah J. Collins, Ikuyo Yamaguchi, Daryl M. Okamura, Thomas H. Bugge, Clare M. Isacke, Claire L. Emson, Scott M. Turner, Stuart J. Shankland and Allison A. Eddy
+
+RNA-Seq defines novel genes, RNA processing patterns and enhancer maps for the early stages of nephrogenesis: Hox supergenes
+Author links open overlay panelEric W.BrunskillS.Steven Potter
+
+
+
+
+
+
+```{r vln-plot-for-fig, fig.height=3, fig.width=9}
+
+prox.list <- c("SLC30A1","SLC51B","FABP3","SULT1E1","SPP1", "JAG1")
+
+cc <- subset(int.neph, idents = 8)
+
+cc <- SetIdent(cc, value = cc$orig.ident)
+
+prox.plt <- VlnPlot(cc, features = prox.list, ncol = 6, pt.size = 0.5)
+
+ggsave(filename = "plots/all/proximal-for-fig.png", prox.plt, width = 9, height = 3) 
+
+prox.plt
+```
+
+```{r DE-neph-distal}
+
+tt <- do_pairwise_edgeR(subset(int.neph, idents = 3))
+
+tt$r0_man
+
+VlnPlot(subset(int.neph, idents = 3), features = c("CITED2","SIX1"), group.by = "orig.ident")
+
+FeaturePlot(int.neph, features = c("CITED2","SIX1"))
+
+```
+Very few changes for CC cluster :
+
+
+```{r DE-neph-prox, fig.height=20, fig.width=12}
+
+tt <- do_pairwise_edgeR(subset(int.neph, idents = 7))
+
+tt$r40_man
+
+VlnPlot(subset(int.neph, idents = 7), 
+        features = c("SPP1","CLDN4","TSPAN1","ARL4C","MT2A",
+                     "MT1E","CLU","BCAM","SLC51B","SCL27A2","MT1F","MT1X","FABP3","SLC30A1","SOX4"), 
+        group.by = "orig.ident", ncol = 3)
+
+
+
+
+```
+
+SPP1 is a kidney injury marker - Kaleta, 2019
+maybe keratins upregulated - see Single Cell Profiling of Acute Kidney Injury Reveals
+Novel Transcriptional Signatures, Mixed Identities
+and Epithelial-to-Stromal Crosstalk (potter)
+
+sox4 also up in potter injury analysis
+
+
+
+
+
+
+
+RE Fos - see:
+Single-cell sequencing reveals
+dissociation-induced gene expression in
+tissue subpopulations - Van Oudenaarden group
+
+
+
+Get DE lists for all clusters individually
+
+```{r eval=FALSE}
+set.markers <- list()
+
+for (c in unique(int.neph@active.ident)){
+  print(c)
+  clust <- subset(int.neph, idents = c)
+  clust <- SetIdent(clust, value = clust@meta.data$orig.ident)
+  markers <- FindAllMarkers(clust)
+  markers <- markers %>% dplyr::filter(p_val_adj < 0.05)
+  markers['from_clust'] <- c
+  set.markers[[c]] <- markers
+  export_marker_xls(markers = markers, 
+                    xls.path = paste0("output/nephron-cluster-comparison/", "20200511-neph_c", c, ".xls"))
+  
+  
+}
+
+```
+
+Plotting genes of interest based on annotation by ML
+
+
+0-GATA3
+1-PODXL
+2-HNF1B
+3-SIX1 
+4-MAFB
+8-CUBN
+
+```{r nephron-markers}
+
+neph.marker.file <- paste0('output/', condition.string, '-neph-cluster-markers.RDS')
+
+if(!file.exists(neph.marker.file)){
+  markers <- FindAllMarkers(int.neph, logfc.threshold = 0.25, only.pos = TRUE)
+  saveRDS(markers, neph.marker.file)
+  export_marker_xls(markers, xls.path = paste0("output/", condition.string, "-neph_cluster_markers.xlsx"))
+}
+
+neph.markers <- readRDS(neph.marker.file)
+```
+
+```{r}
+neph.markers %>% group_by(cluster) %>% top_n(10, pct.1-pct.2)
+
+```
+
+
+
+```{r compare-combes-zappia}
+
+cz.pod <- c("TCF21", "PODXL", "VEGFA", "NPHS1", "PTPRO")
+
+FeaturePlot(int.neph, features = cz.pod, ncol = 3)
+
+cz.pre.pod <- c("CTGF", "OLFM3", "MAFB", "NPHS1")
+
+FeaturePlot(int.neph, features = cz.pre.pod)
+
+cz.prox.pre <- c("IGFBP7", "FXYD2", "CDH6", "HNF1B")
+
+FeaturePlot(int.neph, features = cz.prox.pre)
+
+cz.distal.pre <- c("EPCAM", "EMX2", "SPP1", "MAL", "PAX2")
+
+FeaturePlot(int.neph, features = cz.distal.pre, ncol = 3)
+
+cz.progenitor <- c("DAPL1", "LYPD1", "SIX1", "CRABP2")
+
+FeaturePlot(int.neph, cz.progenitor)
+
+```
+
+
+
+
+
+### endothelial analysis
+
+```{r}
+
+int.endo <- subset(int, subset = global.type == 'Endothelial')
+
+int.endo <- SetIdent(int.endo, value = int.endo@meta.data$orig.ident)
+
+
+```
+
+
+THIS EXCLUDED
+```{r endo-bulk overlap, eval=FALSE, fig.height=20, fig.width=12, include=FALSE}
+
+#significant de genes
+sig.de <- bulk.de %>% dplyr::filter(adj.P.Val < 0.05)
+
+#endo cluster markers
+endo.markers <- markers %>% filter(cluster == 15)
+
+idx <- setdiff(sig.de$GENENAME, endo.markers$gene)
+
+jaccard.endo <- length(intersect(sig.de$GENENAME, endo.markers$gene)) / length(union(sig.de$GENENAME, endo.markers$gene))
+
+sig.de <- sig.de[!duplicated(sig.de$GENENAME) & !is.na(sig.de$GENENAME),]
+
+rownames(sig.de) <- sig.de$GENENAME
+
+non.endo.de <- sig.de[setdiff(sig.de$GENENAME, endo.markers$gene),]
+
+non.endo.de.down <- non.endo.de %>% dplyr::filter(logFC < 0)
+
+int.plt <- SetIdent(int, value = int@meta.data$global.type)
+
+VlnPlot(int.plt, features = non.endo.de.down$GENENAME[1:30], ncol = 3)
+
+
+```
+
+DCN, C10orf10, HLA-B, PTRF, EPYC, STAB1, 
+
+
+Compare markers
+
+
+### Stromal sub-clusters
+
+
+```{r}
+
+stroma.cluster.file <- paste0("output/integrated-", condition.string, "-stroma-subclust.RDS")
+
+if(!file.exists(stroma.cluster.file)){
+  int.stroma <- subset(int, subset = global.type == 'Stroma')
+  int.stroma <- sub_cluster(int.stroma)
+  saveRDS(int.stroma, stroma.cluster.file)
+}else{
+  int.stroma <- readRDS(stroma.cluster.file)
+}
+
+DefaultAssay(int.stroma) <- "RNA"
+int.stroma <- NormalizeData(int.stroma)
+
+
+```
+
+
+
+```{r fig.width=10}
+clustree(int.stroma, assay = "SCT")
+```
+
+
+```{r stroma-umap, fig.height=10, fig.width=4}
+int.stroma <- SetIdent(int.stroma, value = int.stroma@meta.data$SCT_snn_res.0.4)
+
+int.stroma@active.ident <- factor(int.stroma@active.ident, levels = seq(0,10))
+
+p1 <- DimPlot(int.stroma, label = T)
+p2 <- DimPlot(int.stroma, group.by = "Phase")
+p3 <- DimPlot(int.stroma, group.by = "orig.ident")
+
+pp <- gridExtra::grid.arrange(p1, p2, p3, ncol = 1)
+
+ggsave(filename = "plots/all/stroma-UMAP-clusters-phase-set.png", plot = pp, width = 4, height = 10)
+
+```
+
+
+```{r}
+
+```
+
+
+```{r fig.height=12, fig.width=10}
+
+p1 <- VlnPlot(int.stroma, features = "nCount_RNA")
+p2 <- VlnPlot(int.stroma, features = "nFeature_RNA")
+p3 <- VlnPlot(int.stroma, features = "percent.mito")
+p4 <- VlnPlot(int.stroma, features = "scrublet_score", pt.size = 0)
+
+gridExtra::grid.arrange(p1, p2, p3, p4)
+
+
+```
+
+
+
+```{r plot-stroma-props, fig.height=5, fig.width=2}
+stroma.props <- get_props_table(int.stroma)
+
+
+stroma.props$cluster <- factor(stroma.props$cluster, levels = c(seq(0,10)))
+
+stroma.props.plt <- stroma.props %>% filter(!(cluster %in% c(4,5,6)))
+
+stromal.prop.plt <- ggplot(stroma.props.plt, aes(x = condition, y = prop * 100)) + 
+  geom_point(size = 2) + 
+  stat_summary(fun.y = "mean", geom = "point", shape=18, size = 5, colour = "red", alpha = 0.5)+
+  facet_wrap(~cluster, scales = "free", ncol=2) +
+  theme_classic() +
+  xlab(label = "") +
+  ylab(label = "%") +
+    theme(axis.line.x.bottom = element_blank(), axis.ticks.x = element_blank(),
+          strip.text.x = element_text(size=14), strip.background = element_blank(), 
+          axis.text = element_text(size=14))
+
+ggsave(filename = "plots/all/stroma-proportions.png", stromal.prop.plt, width = 4, height = 6)
+
+
+
+
+
+```
+
+
+```{r stats-test-stroma}
+
+for (c in unique(stroma.props$cluster)){
+st <- stroma.props %>% dplyr::filter(cluster == c)
+aa <- aov(prop~condition, data = st)
+print(paste("cluster", c))
+print(summary(aa))
+print(TukeyHSD(aa))
+}
+
+
+```
+
+
+
+```{r stromal-markers}
+
+stroma.marker.file <- paste0('output/', condition.string, '-stroma-cluster-markers.RDS')
+
+if(!file.exists(stroma.marker.file)){
+  stroma.markers <- FindAllMarkers(int.stroma, logfc.threshold = 0.25, only.pos = TRUE)
+  saveRDS(stroma.markers, stroma.marker.file)
+  export_marker_xls(stroma.markers, xls.path = paste0("output/", condition.string, "-stroma_cluster_markers.xlsx"))
+} else {
+stroma.markers <- readRDS(stroma.marker.file)}
+```
+
+
+```{r}
+stroma.markers %>% group_by(cluster) %>% top_n(40, pct.1-pct.2)
+
+stroma.markers %>% filter(cluster == 3)
+```
+
+
+
+
+```{r fig.height=6, fig.width=12}
+
+#plotting clusters with changes in proportion - 7, 10
+
+s.plot.1 <- FeaturePlot(int.stroma, features = c("COL2A1","LHX9","S100A10","WNT5A",
+                                     "ZIC1","ZIC4","ANGPTL1","SEMA5A"), ncol = 4, coord.fixed = T)
+
+ggsave(filename = "plots/all/stromal-feature-plot-c7-10.png", plot = s.plot.1, width = 12, height = 6)
+
+```
+
+Role of Wnt5a-Ror2 Signaling in Morphogenesis of the Metanephric Mesenchyme during Ureteric Budding
+Michiru Nishita, Sen Qiao, Mari Miyamoto, Yuka Okinaka, Makiko Yamada, Ryuju Hashimoto, Kazumoto Iijima, Hiroki Otani, Christine Hartmann, Ryuichi Nishinakamura, Yasuhiro Minami
+
+Non-canonical Wnt5a/Ror2 signaling regulates kidney morphogenesis by controlling intermediate mesoderm extension.
+Yun K1, Ajima R1, Sharma N1, Costantini F2, Mackem S1, Lewandoski M1, Yamaguchi TP1, Perantoni AO3.
+
+
+
+```{r fig.height=6, fig.width=6}
+
+plt <- FeaturePlot(int.stroma, features = c("CITED1","SIX2","GATA","FOXC2"), ncol = 2, coord.fixed = T)
+
+ggsave(filename = "plots/all/stroma-clust-2-markers.png",plot = plt)
+
+```
+
+```{r}
+FeaturePlot(int.stroma, features = c("SOX9","SIX1","SIX2","SOX6"), ncol = 2, coord.fixed = T)
+```
+
+```{r plt-for-imaging-supp}
+
+
+ggsave(filename = "plots/all/stroma-IF-markers.png",
+       plot = FeaturePlot(int.stroma, features = c("MEIS1","MEIS2","SIX1","SOX9"), ncol = 4, coord.fixed = T), width = 14)
+
+
+
+
+
+
+```
+
+
+```{r clust-2-vln-for-fig, fig.height=4, fig.width=3}
+
+ggsave(filename = "plots/all/stroma-clust2-vln.png", 
+plot_by_set(int.stroma, clust = 2, genes = c("RSPO3","WNT5A"), ncol = 2, pt.size = 0.01),
+width = 4, height = 3)
+
+
+```
+
+```{r clust3-vln-for-fig, fig.height=3, fig.width=8}
+
+ggsave(filename = "plots/all/stroma-clust3-vln.png", 
+plot_by_set(int.stroma, clust = 3, genes = c("HOXA11","FOXC2","EYA1","SIX1"), ncol = 4, pt.size = 0.01),
+width = 8, height = 3)
+
+```
+
+
+
+
+```{r fig.height=12, fig.width=12}
+#plotting clusters that appear to have more DE genes
+
+
+stromal.feature.plt <- FeaturePlot(int.stroma, features = c("WFDC2","POSTN","COL9A2","USH1C",
+                                     "CSRP2","CRABP1","LHX9","PRRX1",
+                                     "CITED1","NAV3","RSPO3","FGF7",
+                                     "NEFM","CAMK2N1","CDH2","GATA3"
+                                     ), ncol = 4, coord.fixed = T)
+
+ggsave(filename = "plots/all/stroma-feature-plot-c0-1-2-3.png", plot = stromal.feature.plt, width = 12, height = 12)
+
+```
+```{r stroma-plot-supp-fig, fig.height=10, fig.width=6}
+
+ggsave(filename = "plots/all/stroma-clust-markers-supp.png",
+FeaturePlot(int.stroma, features = c("SIX2","LYPD1","FOXC2","HOXA11",
+                                     "WNT5A","LHX9",
+                                     "ZIC1","ZIC4"), ncol = 2),
+width = 6, height = 10)
+
+
+```
+
+
+
+NAV 3 is a target of sox9 :
+
+https://www.biorxiv.org/content/10.1101/838441v1.full
+
+
+
+```{r stroma-cluster-de}
+
+get_stromal_de <- function(obj){
+
+all_r40_r0 <- lapply(unique(obj@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(obj, idents = x))
+  out <- de$r40_r0$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+all_r40_r0 <- do.call(rbind, all_r40_r0)
+write.csv(all_r40_r0, "DE-testing/stroma/stroma_r40_r0-DE.csv")
+all_r40_r0 %>% group_by(cluster) %>% summarise("n.de" = n())
+all_r40_r0 %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n())%>% arrange(-count)
+
+
+all_r40_man <- lapply(unique(obj@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(obj, idents = x))
+  out <- de$r40_man$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+
+all_r40_man <- do.call(rbind, all_r40_man)
+write.csv(all_r40_man, "DE-testing/stroma/stroma_r40_man-DE.csv")
+all_r40_man %>% group_by(cluster) %>% summarise("n.de" = n())
+all_r40_man %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n()) %>% arrange(-count)
+
+
+all_any <- lapply(unique(obj@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(obj, idents = x))
+  out <- de$any$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+
+all_any <- do.call(rbind, all_any)
+write.csv(all_any, "DE-testing/stroma/stroma_any-DE.csv")
+all_any %>% group_by(cluster) %>% summarise("n.de" = n())
+all_any %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n()) %>% arrange(-count)
+
+
+all_r0_man <- lapply(unique(obj@active.ident), function(x) {
+  de <- do_pairwise_edgeR(subset(obj, idents = x))
+  out <- de$r0_man$table
+  out['gene'] <- rownames(out)
+  out['cluster'] <- x
+  return(out)
+})
+
+all_r0_man <- do.call(rbind, all_r0_man)
+write.csv(all_r0_man, "DE-testing/stroma/stroma_r0_man-DE.csv")
+all_r0_man %>% group_by(cluster) %>% summarise("n.de" = n())
+all_r0_man %>% group_by(gene) %>% filter(n()>2) %>% summarise('count' = n()) %>% arrange(-count)
+
+r40_r0.table <- all_r40_r0 %>% group_by(gene) %>% filter(n()< 4) %>% group_by(cluster) %>% summarise(n.de = n())
+
+r40_man.table <- all_r40_man %>% group_by(gene) %>% filter(n()< 4) %>% group_by(cluster) %>% summarise(n.de = n())
+
+r0_man.table <- all_r0_man %>% group_by(gene) %>% filter(n()< 4) %>% group_by(cluster) %>% summarise(n.de = n())
+
+de.table <- dplyr::full_join(r40_r0.table, r40_man.table, by = "cluster") %>% as.data.frame()
+colnames(de.table) <- c("cluster","R40-R0", "R40-Man")
+
+de.table <- dplyr::full_join(de.table, r0_man.table, by = "cluster") %>% as.data.frame()
+colnames(de.table)[4] <- "R0-Man"
+
+de.table[is.na(de.table)] <- 0
+
+rownames(de.table) <- labels(de.table$cluster)
+
+return(de.table)
+
+}
+
+
+stromal.de.table <- get_stromal_de(int.stroma)
+
+
+
+
+```
+
+
+
+
+
+```{r fig.height=6, fig.width=6}
+
+!(3 %in% c(3,4,5))
+
+plt.table <- stromal.de.table %>% filter(!(cluster %in% c(4,5,6)))
+
+pdf("plots/all/stromal-DE-genes-per-clust.pdf", width = 6, height = 6)
+gplots::heatmap.2(as.matrix(plt.table[,2:4]), Colv = TRUE, labRow = plt.table$cluster, 
+                  Rowv = TRUE, dendrogram = "none", col = viridis::viridis(60), 
+                  density.info = "none", trace = 'none', cexRow = 2, cexCol = 2,  
+                  keysize = 1, margins = c(10,10),
+                  key.par = list(cex=0.5), key.title = "", key.xlab = "No. DE genes")
+dev.off()
+
+
+
+
+```
+
+Get lists of some genes :
+
+
+```{r fig.height=4, fig.width=8}
+
+df <- read.csv("DE-testing/stroma/stroma_r40_man-DE.csv", stringsAsFactors = F)
+df <- df %>% group_by(gene) %>% filter(n()<4) %>% ungroup() %>% group_by(cluster) 
+write.csv(file = "DE-testing/stroma/filtered_4-or-less-r40_man-DE.csv", x = df)
+
+df <- read.csv("DE-testing/stroma/stroma_r40_r0-DE.csv", stringsAsFactors = F)
+df <- df %>% group_by(gene) %>% filter(n()<4) %>% ungroup() %>% group_by(cluster) 
+write.csv(file = "DE-testing/stroma/filtered_4-or-less-r40_r0-DE.csv", x = df)
+
+df <- read.csv("DE-testing/stroma/stroma_r0_man-DE.csv", stringsAsFactors = F)
+df <- df %>% group_by(gene) %>% filter(n()<4) %>% ungroup() %>% group_by(cluster) 
+write.csv(file = "DE-testing/stroma/filtered_4-or-less-r0_man-DE.csv", x = df)
+
+
+plot_by_set(int.stroma, 2, c("WNT5A","TCF7L2","RSPO3"))
+
+C0
+ZNF275,PLXNA4,SLC7A6,ABCA1
+
+
+C1
+PDGFRB,ALDH1A2,SYMPK
+
+
+C2
+RSPO3,MEIS2,NEXN,FAT1,POMC,NAV3,HES1
+RAB31,ETV6,FOXJ2,SKI,FARP2,TIMP3
+MYL1,ETV6,EYA1
+
+C3
+SIX1,EYA1,HES1,SKIDA1,FAM84A
+
+```
+TOPFUNN go searches :
+filtered lists for R40 vs Man :
+
+C2 : downloaded
+
+C0:no sig BP for up genes
+no sig BP for down genes - translation, mitochondrial but not sig after correction.
+
+TOPFUNN go searches :
+filtered lists for R40 vs R0 :
+
+C0 DOWN: 
+1	GO:0034622	cellular protein-containing complex assembly		2.723E-10	9.883E-7	8.672E-6	9.883E-7	40	1276
+2	GO:0006457	protein folding		3.175E-9	5.763E-6	5.057E-5	1.153E-5	16	234
+3	GO:0031145	anaphase-promoting complex-dependent catabolic process		1.300E-8	1.374E-5	1.206E-4	4.719E-5	10	82
+4	GO:0055114	oxidation-reduction process		1.514E-8	1.374E-5	1.206E-4	5.497E-5	36	1231
+5	GO:0006119	oxidative phosphorylation		6.947E-8	4.007E-5	3.516E-4	2.522E-4	12	153
+6	GO:0015986	ATP synthesis coupled proton transport		8.610E-8	4.007E-5	3.516E-4	3.125E-4	12	156
+7	GO:0015985	energy coupled proton transport, down electrochemical gradient		8.610E-8	4.007E-5	3.516E-4	3.125E-4	12	156
+8	GO:0044265	cellular macromolecule catabolic process		8.831E-8	4.007E-5	3.516E-4	3.206E-4	34	1201
+9	GO:0048002	antigen processing and presentation of peptide antigen		1.255E-7	5.064E-5	4.443E-4	4.557E-4	13	194
+10	GO:0140014	mitotic nuclear division
+
+
+C0 UP:
+1	GO:0060541	respiratory system development		6.178E-10	1.195E-6	1.050E-5	2.280E-6	16	259
+2	GO:0030324	lung development		7.609E-10	1.195E-6	1.050E-5	2.808E-6	15	225
+3	GO:0030323	respiratory tube development		9.711E-10	1.195E-6	1.050E-5	3.584E-6	15	229
+4	GO:0009790	embryo development		1.679E-8	1.549E-5	1.362E-4	6.196E-5	32	1263
+5	GO:0022008	neurogenesis		2.045E-7	1.509E-4	1.327E-3	7.547E-4	38	1867
+6	GO:0031175	neuron projection development		3.474E-7	1.603E-4	1.410E-3	1.282E-3	28	1151
+7	GO:0048699	generation of neurons		3.681E-7	1.603E-4	1.410E-3	1.359E-3	36	1752
+8	GO:0051960	regulation of nervous system development		3.930E-7	1.603E-4	1.410E-3	1.450E-3	27	1088
+9	GO:0048589	developmental growth		4.076E-7	1.603E-4	1.410E-3	1.505E-3	23	822
+10	GO:0009792	embryo development ending in birth or egg hatching		4.725E-7	1.603E-4	1.410E-3	1.744E-3	23	829
+11	GO:0009887	animal organ morphogenesis		4.778E-7	1.603E-4	1.410E-3	1.764E-3	29	1241
+12	GO:0000902	cell morphogenesis		5.628E-7	1.681E-4	1.478E-3	2.077E-3	28	1179
+13	GO:0040007	growth		5.921E-7	1.681E-4	1.478E-3	2.185E-3	28	1182
+14	GO:0032989	cellular component morphogenesis		1.173E-6	2.916E-4	2.564E-3	4.329E-3	29	1297
+15	GO:0048598	embryonic morphogenesis		1.185E-6	2.916E-4	2.564E-3	4.375E-3	20	681
+16	GO:0007423	sensory organ development		1.624E-6	3.746E-4	3.293E-3	5.993E-3	19	633
+17	GO:0030182	neuron differentiation		2.517E-6	5.436E-4	4.779E-3	9.291E-3	32	1579
+18	GO:0035295	tube development		2.651E-6	5.436E-4	4.779E-3	9.786E-3	28	1276
+19	GO:0060284	regulation of cell development		2.831E-6	5.500E-4	4.835E-3	1.045E-2	26	1133
+20	GO:0048666	neuron development		3.678E-6	6.787E-4	5.966E-3	1.357E-2	28	1298
+21	GO:0043009	chordate embryonic development		4.166E-6	7.322E-4	6.437E-3	1.538E-2	21	806
+22	GO:0048096	chromatin-mediated maintenance of transcription		4.480E-6	7.517E-4	6.608E-3	1.654E-2	4	14
+23	GO:0048562	embryonic organ morphogenesis		5.110E-6	8.201E-4	7.209E-3	1.886E-2	13	334
+24	GO:0048568	embryonic organ development		5.898E-6	9.071E-4	7.974E-3	2.177E-2	16	506
+25	GO:0050767	regulation of neurogenesis		6.891E-6	1.017E-3	8.944E-3	2.543E-2	23	972
+26	GO:0090596	sensory organ morphogenesis		1.259E-5	1.787E-3	1.571E-2	4.646E-2
+
+
+
+
+
+
+### bulk-comparison
+
+```{r load-bulk-data}
+
+bulk.de <- read.csv("/group/kidn1/hpc/KEG/Profiling_RNAseq/DD104_MAFB-GATA3_bulkRNAseq/analysis/out/R40_v_R0_all_DE.csv", stringsAsFactors = F)
+
+sig.de <- bulk.de %>% dplyr::filter(PValue < 0.05)
+
+#sig.de <- sig.de[!duplicated(sig.de$GENENAME) & !is.na(sig.de$GENENAME),]
+
+colnames(sig.de)[1] <- "gene"
+rownames(sig.de) <- sig.de$gene
+  
+top100 <- sig.de %>% dplyr::top_n(-100, PValue) %>% arrange(logFC)
+
+
+
+
+```
+
+```{r fig.height=12, fig.width=12}
+
+clust.sce <- as.SingleCellExperiment(SetIdent(int, value = int@meta.data$global.type))
+clust.agg <- scater::sumCountsAcrossCells(clust.sce,
+               ids=paste0(clust.sce@colData$rep, clust.sce@colData$global.type))
+               
+colnames(clust.agg)
+
+logcounts <- cpm(as.matrix(clust.agg), log = T)
+
+top100.common <- intersect(rownames(logcounts),top100$gene)
+
+logcounts[top100.common,]
+
+pdf(file = "plots/all/DE-cluster-comparison.pdf", width = 12, height = 12)
+gplots::heatmap.2(logcounts[top100.common,], trace = "none", scale = "row", 
+                  col = viridis::viridis(60), margins = c(10,10), 
+                  keysize = 1, lhei = c(1,10), key.title = NA)
+dev.off()
+
+```
+
+
+
+```{r}
+
+sub.de <- sig.de %>% dplyr::filter(PValue < 0.05)
+
+for (c in unique(markers$cluster)){
+ 
+  print(c)
+  clust <- markers %>% dplyr::filter(p_val_adj < 0.05 & cluster == c)
+  jacc <- length(intersect(sub.de$GENENAME, clust$gene)) / length(union(sub.de$GENENAME, clust$gene))
+  print(jacc)
+  
+  }
+
+```
+
+
+
+```{r}
+sessionInfo()
+```
+
+

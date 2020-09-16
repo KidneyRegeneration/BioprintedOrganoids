@@ -1,0 +1,326 @@
+---
+title: "Quality control of Bioprint Datasets 2020"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is a record of analysis of three datasets generated from kidney organoids with three different conformations :
+
+'hand' - traditional hand made organoids using a centrifuge.
+
+'dots' - single deposition bioprinted organonids to replicate the handmade protocol.
+
+'line' - line organoids, where the same number of cells as 'dots' are spread out over a thing line with movement:extrusion ration of 40:1 (distance moved : syringe plunger displacement)
+
+
+
+```{r load-libraries}
+library(Seurat)
+library(ggplot2)
+library(future)
+library(dplyr)
+library(clustree)
+
+if (supportsMulticore()){
+  
+plan('multiprocess', workers=8)
+options(future.globals.maxSize = 12000 * 1024^2)
+print('Using parallel processing')
+
+} else {
+  print('multi-core disabled on Rstudio')
+}
+
+
+
+```
+
+
+
+
+
+```{r load-data}
+
+if(!file.exists("output/load-all.RDS")){
+
+load_data <- function(location, project_name){
+  seurat <- Read10X(paste0(location, "outs/filtered_feature_bc_matrix/"))
+  seurat <- CreateSeuratObject(counts = seurat, project = project_name, min.cells = 20)
+  seurat <- PercentageFeatureSet(seurat, pattern = "^MT-", col.name = "percent.mito")
+  
+  scrublet <- read.csv(paste0(location, "outs/scrublet/predicted_doublets.csv"))
+  seurat@meta.data['scrublet_score'] <- scrublet$doublet_scores
+  seurat@meta.data['scrublet_prediction'] <- scrublet$predicted_doublets
+  
+  return(seurat)
+}
+
+dt <- load_data("../dots/BP-dots/", 'dots')
+ln <- load_data("../line/BP-line/", 'line')
+hd <- load_data("../hand/BP-hand/", 'hand')
+
+sets.list <- list(dt, ln, hd)
+
+saveRDS(object=sets.list, file="output/load-all.RDS")
+
+}else
+  {
+  sets.list <- readRDS("output/load-all.RDS")
+}
+
+
+
+```
+
+```{r}
+add_hto <- function(cdna, hto_count_path, cutoff){
+
+hto <- Read10X(data.dir = hto_count_path, gene.column = 1)
+
+#remove the 'unmapped' row as this confuses the automatic HTO assignment below
+oligos <- rownames(hto)[1:4]
+hto <- hto[oligos,]
+
+#use only matching barcodes
+cdna.barcodes <- colnames(cdna)
+hto.barcodes <- colnames(hto)
+common.barcodes <- intersect(hto.barcodes, cdna.barcodes)
+cdna <- cdna[,common.barcodes]
+hto <- hto[,common.barcodes]
+
+#add HTO data, normalise and scale
+cdna[["HTO"]] <- CreateAssayObject(counts = hto)
+cdna <- NormalizeData(cdna, assay = "HTO", normalization.method = "CLR")
+cdna <- ScaleData(cdna, assay = "HTO")
+cdna <- HTODemux(cdna, assay = 'HTO', positive.quantile = cutoff, init = 5)
+
+return(cdna)
+}
+
+```
+
+```{r hto-load-dots, fig.height=12}
+
+dots <- sets.list[[1]]
+dots <- add_hto(dots, '../dots/cite-seq-count/umi_count/', 0.993)
+table(dots@meta.data$HTO_classification.global)
+table(dots@meta.data$hash.ID)
+RidgePlot(dots, features = unique(dots@meta.data$hash.ID), group.by = "hash.ID", ncol = 1)
+
+```
+
+
+
+```{r hto-load-line, fig.height=12}
+
+line <- sets.list[[2]]
+line <- add_hto(line, '../line/cite-seq-count/umi_count/', 0.90)
+table(line@meta.data$HTO_classification.global)
+table(line@meta.data$hash.ID)
+RidgePlot(line, features = unique(line@meta.data$hash.ID), group.by = "hash.ID", ncol = 1)
+
+```
+
+```{r hto-load-hand, fig.height=12}
+
+hand <- sets.list[[3]]
+hand <- add_hto(hand, '../hand/cite-seq-count/umi_count/', 0.999)
+table(hand@meta.data$HTO_classification.global)
+table(hand@meta.data$hash.ID)
+RidgePlot(hand, features = unique(hand@meta.data$hash.ID), group.by = "hash.ID", ncol = 1)
+
+```
+
+
+
+
+
+
+
+```{r}
+# this takes ages to run :
+
+hto.dist.mtx <- as.matrix(dist(t(GetAssayData(object = dots, assay = "HTO"))))
+dots <- RunTSNE(dots, distance.matrix = hto.dist.mtx, perplexity = 50)
+DimPlot(dots, group.by = 'hash.ID', reduction = "tsne")
+
+```
+
+
+```{r}
+
+# this takes ages to run :
+
+hto.dist.mtx <- as.matrix(dist(t(GetAssayData(object = line, assay = "HTO"))))
+line <- RunTSNE(line, distance.matrix = hto.dist.mtx, perplexity = 50)
+DimPlot(line, group.by = 'hash.ID', reduction = "tsne")
+
+```
+
+```{r}
+hto.dist.mtx <- as.matrix(dist(t(GetAssayData(object = hand, assay = "HTO"))))
+hand <- RunTSNE(hand, distance.matrix = hto.dist.mtx, perplexity = 50)
+DimPlot(hand, group.by = 'hash.ID', reduction = "tsne")
+```
+
+```{r remove-doublets}
+
+keep_singlets <- function(seurat){
+  seurat <- SetIdent(seurat, value = seurat@meta.data$HTO_classification.global)
+  seurat <- subset(seurat, idents = "Singlet")
+  return(seurat)
+}
+
+
+
+dots <- keep_singlets(dots)
+line <- keep_singlets(line)
+hand <- keep_singlets(hand)
+
+```
+
+
+
+```{r fig.height=15, fig.width=10}
+
+
+
+
+p1 <- FeatureScatter(line, feature1 = "nCount_RNA", feature2 = 'percent.mito') + geom_hline(yintercept =15)
+p2 <- FeatureScatter(dots, feature1 = "nCount_RNA", feature2 = 'percent.mito') + geom_hline(yintercept =15)
+p3 <- FeatureScatter(hand, feature1 = "nCount_RNA", feature2 = 'percent.mito')+ geom_hline(yintercept =15)
+
+
+gridExtra::grid.arrange(p1, p2, p3, ncol=2)
+
+```
+
+
+
+
+
+```{r}
+sets.list <- list(dots, line, hand)
+
+filter_sets <- function(set){
+  set <- subset(set, subset = percent.mito < 15 )
+  return(set)
+}
+
+sets.list <- lapply(sets.list, filter_sets)
+
+```
+
+```{r fig.height=15, fig.width=10}
+
+cutoff = 1000
+
+p1 <- FeatureScatter(sets.list[[1]], feature1 = "percent.mito", feature2 = 'nFeature_RNA') + scale_y_log10() + geom_hline(yintercept =cutoff)
+
+
+p2 <- FeatureScatter(sets.list[[2]], feature1 = "percent.mito", feature2 = 'nFeature_RNA') + scale_y_log10() +
+  geom_hline(yintercept =cutoff )
+p3 <- FeatureScatter(sets.list[[3]], feature1 = "percent.mito", feature2 = 'nFeature_RNA') + scale_y_log10() +
+  geom_hline(yintercept =cutoff) 
+
+
+gridExtra::grid.arrange(p1, p2, p3, ncol=2)
+
+```
+
+
+```{r}
+filter_sets <- function(set){
+  set <- subset(set, subset = nFeature_RNA > 1000 )
+  return(set)
+}
+
+sets.list <- lapply(sets.list, filter_sets)
+
+```
+
+Now Looking at doublet detection scores from scrublet
+
+
+```{r fig.height=12, fig.width=10}
+p1 <- FeatureScatter(sets.list[[1]], feature1 = "scrublet_score", feature2 = 'nFeature_RNA')
+p2 <- FeatureScatter(sets.list[[2]], feature1 = "scrublet_score", feature2 = 'nFeature_RNA') 
+p3 <- FeatureScatter(sets.list[[3]], feature1 = "scrublet_score", feature2 = 'nFeature_RNA') 
+
+
+gridExtra::grid.arrange(p1, p2, p3, ncol=2)
+```
+```{r fig.height=12, fig.width=10}
+p1 <- VlnPlot(sets.list[[1]], features = "scrublet_score", y.max = 1)
+p2 <- VlnPlot(sets.list[[2]], features = "scrublet_score", y.max = 1)
+p3 <- VlnPlot(sets.list[[3]], features = "scrublet_score", y.max = 1)
+
+gridExtra::grid.arrange(p1, p2, p3, ncol=3)
+
+```
+
+
+
+```{r}
+sets.list[[1]]
+
+sets.list[[2]]
+
+sets.list[[3]]
+```
+
+
+
+Run SCtransform here
+
+```{r}
+
+sctransform_all <- function(set){
+  set <- SCTransform(set)
+  return(set)
+}
+
+sets.list <- parallel::mclapply(sets.list, sctransform_all, mc.cores = 4)
+
+saveRDS(sets.list, "output/sctransform-all.RDS")
+
+```
+
+```{r}
+
+integrate_sets <- function(sets.list){
+  
+  set.features <- SelectIntegrationFeatures(object.list = sets.list, nfeatures = 3000)
+  sets.list <- PrepSCTIntegration(object.list = sets.list, anchor.features = set.features)
+  sets.anchors <- FindIntegrationAnchors(object.list = sets.list, normalization.method = "SCT",
+                                         anchor.features = set.features)
+  sets.integrated <- IntegrateData(anchorset = sets.anchors, normalization.method = "SCT")
+  return(sets.integrated)
+  
+}
+
+# for all
+
+sets.integrated <- integrate_sets(sets.list)
+saveRDS(object = sets.integrated, file = "output/integrated-all.RDS")
+
+# for dots-hand
+
+#sets.integrated <- integrate_sets(sets.list[c(1,3)])
+#saveRDS(object = sets.integrated, file = "output/integrated-dots-hand.RDS")
+
+# for dots-line
+
+#sets.integrated <- integrate_sets(sets.list[c(1,2)])
+#saveRDS(object = sets.integrated, file = "output/integrated-dots-line.RDS")
+
+```
+
+
+
+
+
+
+
+
