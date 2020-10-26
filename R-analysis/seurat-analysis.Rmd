@@ -12,7 +12,7 @@ output:
 knitr::opts_chunk$set(warning=FALSE, message=FALSE)
 ```
 
-This notebook describes the analysis comparing all datasets : handmade 'hand', single deposition organoids, and line organoids.
+This notebook describes the analysis comparing all datasets : handmade/manual 'hand', single deposition organoids (R0), and line organoids (R40).
 
 Data have been normalised using SCTransform and integrated.
 
