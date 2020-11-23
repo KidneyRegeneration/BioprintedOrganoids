@@ -10,6 +10,7 @@ Each of the conditions, Ratio0 ('dots'), Ratio40 ('line'), Man ('hand') has an a
 The folder R-analysis contains the R notebooks that document the Seurat based analysis, including QC, clustering and differential expression testing.
 
 R-analysis/Seurat-analysis-QC.Rmd describes the initial QC and incorporation of hash tag data.
+
 R-analysis/Seurat-analysis.Rmd describes all other analysis.
 
 Scrublet/run_scrublet.py is the script used to perform computational doublet prediction using <a href="https://github.com/AllonKleinLab/scrublet">scrublet</a>.
